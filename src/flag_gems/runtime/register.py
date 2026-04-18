@@ -24,6 +24,10 @@ class Register:
         self.reg_key = self.device.dispatch_key
         self.all_ops = []
         self.all_keys = []
+        if self.device.vendor == common.vendors.CAMBRICON:
+            # TODO: Cambricon specific, to avoid op deadlock question in libtuner.
+            # Should remove this in the future.
+            self.torch_ops_map = {}
 
         # optional mapping func_name -> list of config entries
         self.full_config_by_func = full_config_by_func
@@ -110,7 +114,22 @@ class Register:
         device_key = self.reg_key
         self.all_ops.append(fn.__name__)
         self.all_keys.append(key)
-        self.lib.impl(key, fn, device_key)
+        if self.device.vendor == common.vendors.CAMBRICON:
+            import torch
+
+            try:
+                self.torch_ops_map["aten::" + key] = torch.library.get_kernel(
+                    "aten::" + key, device_key
+                )
+            except Exception:
+                pass
+            try:
+                self.lib.impl(key, fn, device_key, allow_override=True)
+            except TypeError:
+                # Older torch versions don't support allow_override
+                self.lib.impl(key, fn, device_key)
+        else:
+            self.lib.impl(key, fn, device_key)
 
     def for_each(self):
         for key, func in self.config:
