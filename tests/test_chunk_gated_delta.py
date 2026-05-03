@@ -1,6 +1,7 @@
 import torch
 import pytest
 import triton
+from flag_gems.ops.chunk_gated_delta import FlagOS_ChunkGatedDelta
 
 def native_pytorch_chunk_gated_delta(q, k, v, beta):
     """
