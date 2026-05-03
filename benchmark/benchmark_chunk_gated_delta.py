@@ -28,7 +28,7 @@ from flag_gems.ops.chunk_gated_delta import (
 
 # ── benchmark settings ───────────────────────────────────────────────────────
 DEVICE = "cuda"
-DTYPE = torch.float32   # use float32 for fair fp-exact comparison
+DTYPE = torch.float32   # use float32 for deterministic precision comparison
 B, H, D = 2, 4, 64      # batch, heads, head-dim (typical attention shape)
 BT = 16                  # chunk-size arg (kept for API compat)
 WARMUP = 10              # kernel warm-up iterations

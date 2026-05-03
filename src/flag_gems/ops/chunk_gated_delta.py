@@ -243,7 +243,7 @@ def _triton_forward(
     # Grid: dim-0 = (batch, head) pairs; dim-1 = column blocks.
     # BDC is selected by autotuning; capped at BD via ``_prune_cgd_configs``.
     # ``triton.cdiv(BD, BDC)`` gives the number of column-block programs.
-    grid = lambda meta: (B * H, triton.cdiv(BD, min(meta["BDC"], BD)))
+    grid = lambda meta: (B * H, triton.cdiv(BD, meta["BDC"]))
 
     _cgd_fwd_kernel[grid](
         q,
