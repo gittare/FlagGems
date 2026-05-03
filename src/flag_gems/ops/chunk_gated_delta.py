@@ -7,18 +7,19 @@ Forward recurrence (per head, sequential over T):
     S_t = S_{t-1}  +  β_t · outer(k_t, r_t)   # rank-1 state update
     o_t = q_t @ S_t                        # output
 
-Key design decisions vs. the broken original
---------------------------------------------
-* No ``tl.make_block_ptr`` – that was the source of the LLVM struct
-  size-mismatch ("expected 4 but got 1").  Plain scalar-offset loads
-  are used throughout.
-* No ``tl.dot`` – its shape constraints (inner dim ≥ 16, both dims
-  power-of-2) caused silent wrong results for small D.  All products
-  are expressed as element-wise broadcast + ``tl.sum``.
-* BD (block dim) is the next power-of-two ≥ D.  A mask guards
-  out-of-range lanes when BD > D.
-* Backward is a pure-PyTorch analytic reverse scan – correct and
-  differentiable, easy to audit.  A Triton backward can be added later.
+Performance design
+------------------
+* Column-partition parallelism: each Triton program handles one
+  (batch, head, col_chunk) triple and stores only a [BD, BDC] slice of
+  S in registers.  This reduces register pressure by BD/BDC× and
+  increases concurrent programs by the same factor, dramatically
+  improving GPU occupancy.
+* Autotuning over BDC (column-block width), num_warps, and num_stages
+  (software-pipeline depth) via ``triton.autotune``.
+* No ``tl.make_block_ptr`` – plain scalar-offset loads avoid the LLVM
+  struct size-mismatch error.
+* Backward is a pure-PyTorch analytic reverse scan – correct,
+  differentiable, and easy to audit.
 """
 
 import torch
@@ -68,10 +69,49 @@ def torch_chunk_gated_delta_rule(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2.  Triton Forward Kernel
+# 2.  Triton Forward Kernel – Column-Partitioned with Autotuning
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _prune_cgd_configs(configs, named_args, **kwargs):
+    """
+    Drop autotune configs where BDC > BD (column block wider than the
+    padded head dim D).  Such configs waste registers by keeping unused
+    padding columns in S_local.  Falls back to a single-block config
+    covering all BD columns for very small D.
+    """
+    # Use D (a runtime int arg) to compute BD; fall back to 64 if absent.
+    D = named_args.get("D", 64)
+    BD = triton.next_power_of_2(D)
+    pruned = [c for c in configs if c.kwargs.get("BDC", 16) <= BD]
+    if not pruned:
+        # For very small D (e.g. D=8), use 1 block covering all BD columns.
+        return [triton.Config({"BDC": BD}, num_warps=4, num_stages=1)]
+    return pruned
+
+
+@triton.autotune(
+    configs=[
+        # BDC=8 – for very small D (D≤16) or extra parallelism at large D
+        triton.Config({"BDC": 8}, num_warps=4, num_stages=1),
+        triton.Config({"BDC": 8}, num_warps=8, num_stages=1),
+        # BDC=16 – smallest tested column block; 4 programs per (b,h) for D=64
+        triton.Config({"BDC": 16}, num_warps=4, num_stages=1),
+        triton.Config({"BDC": 16}, num_warps=4, num_stages=2),
+        triton.Config({"BDC": 16}, num_warps=8, num_stages=1),
+        triton.Config({"BDC": 16}, num_warps=8, num_stages=2),
+        # BDC=32 – balanced; 2 programs per (b,h) for D=64
+        triton.Config({"BDC": 32}, num_warps=4, num_stages=1),
+        triton.Config({"BDC": 32}, num_warps=4, num_stages=2),
+        triton.Config({"BDC": 32}, num_warps=8, num_stages=1),
+        triton.Config({"BDC": 32}, num_warps=8, num_stages=2),
+        # BDC=64 – largest tested block; 1 program per (b,h) for D=64
+        triton.Config({"BDC": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BDC": 64}, num_warps=8, num_stages=1),
+    ],
+    key=["T", "BD"],
+    prune_configs_by={"early_config_prune": _prune_cgd_configs},
+)
 @triton.jit
 def _cgd_fwd_kernel(
     # ── tensor pointers ──────────────────────────────────────────────────────
@@ -108,66 +148,80 @@ def _cgd_fwd_kernel(
     H,  # int – number of heads
     T,  # int – sequence length
     D,  # int – head dimension
-    # ── compile-time constant ────────────────────────────────────────────────
-    BD: tl.constexpr,  # next_power_of_2(D) >= D
+    # ── compile-time constants ────────────────────────────────────────────────
+    BD: tl.constexpr,   # next_power_of_2(D) – full row block (padded D)
+    BDC: tl.constexpr,  # column block width; BD // BDC programs per (b,h)
 ):
     """
-    One Triton program per (batch, head) pair.
+    Column-partitioned forward kernel.
 
-    State S  [BD × BD] lives entirely in registers.
-    T steps are executed sequentially inside a single thread block so that
-    the data dependency  S_t → S_{t+1}  is respected.
+    Grid: ``(B*H,  BD // BDC)`` programs.
 
-    All tensor reads/writes use plain scalar offsets – no block-pointer
-    API – to avoid the LLVM struct packing error that plagued the original.
+    Each program handles **all T timesteps** for one (batch, head, col_chunk)
+    triple, maintaining only the column slice
+        S_local  [BD, BDC]  =  S[:, col_start : col_start + BDC]
+    in registers.  All delta-rule operations decompose cleanly over columns:
+
+      kS_col[j] = Σ_i  k_t[i] · S_local[i, j]   (needs full k_t row)
+      r_t_col   = v_t_col − kS_col               (local)
+      S_local  += β_t · outer(k_t, r_t_col)      (local)
+      o_t_col[j]= Σ_i  q_t[i] · S_local[i, j]   (needs full q_t row)
+
+    No cross-program synchronisation is required.
     """
-    bh = tl.program_id(0)
-    b = bh // H
-    h = bh % H
+    pid_bh  = tl.program_id(0)   # (batch, head) index
+    pid_col = tl.program_id(1)   # column-block index
 
-    # Lane indices and validity mask
-    d = tl.arange(0, BD)  # [BD]
-    mask = d < D  # True for valid lanes
+    b = pid_bh // H
+    h = pid_bh  % H
+    col_start = pid_col * BDC
 
-    # Precompute base offsets (time-independent)
-    q0 = b * sq_b + h * sq_h
-    k0 = b * sk_b + h * sk_h
-    v0 = b * sv_b + h * sv_h
-    b0 = b * sb_b + h * sb_h
-    o0 = b * so_b + h * so_h
+    # Index arrays
+    d_row = tl.arange(0, BD)                # [BD]  – full row dim
+    d_col = col_start + tl.arange(0, BDC)  # [BDC] – this column slice
 
-    # State matrix, initialised to zero
-    S = tl.zeros([BD, BD], dtype=tl.float32)  # [BD, BD]
+    row_mask = d_row < D   # [BD]
+    col_mask = d_col < D   # [BDC]
+
+    # Base pointers (time-independent offsets to the (b, h) slice)
+    q_base    = Q    + b * sq_b + h * sq_h
+    k_base    = K    + b * sk_b + h * sk_h
+    v_base    = V    + b * sv_b + h * sv_h
+    beta_base = Beta + b * sb_b + h * sb_h
+    o_base    = O    + b * so_b + h * so_h
+
+    # Column slice of the state matrix S  [BD, BDC], initialised to 0
+    S_local = tl.zeros([BD, BDC], dtype=tl.float32)
 
     for t in range(T):
-        # ── load vectors for timestep t ─────────────────────────────────────
-        k_t = tl.load(K + k0 + t * sk_t + d * sk_d, mask=mask, other=0.0).to(
-            tl.float32
-        )  # [BD]
-        v_t = tl.load(V + v0 + t * sv_t + d * sv_d, mask=mask, other=0.0).to(
-            tl.float32
-        )  # [BD]
-        q_t = tl.load(Q + q0 + t * sq_t + d * sq_d, mask=mask, other=0.0).to(
-            tl.float32
-        )  # [BD]
-        bt = tl.load(Beta + b0 + t * sb_t).to(tl.float32)  # scalar
+        # ── load this timestep ───────────────────────────────────────────────
+        k_t = tl.load(
+            k_base + t * sk_t + d_row * sk_d, mask=row_mask, other=0.0
+        ).to(tl.float32)   # [BD]
+        v_t = tl.load(
+            v_base + t * sv_t + d_col * sv_d, mask=col_mask, other=0.0
+        ).to(tl.float32)   # [BDC]
+        bt  = tl.load(beta_base + t * sb_t).to(tl.float32)   # scalar
 
-        # ── delta-rule state update ─────────────────────────────────────────
-        #   kS[j]  = Σ_i  k_t[i] * S[i, j]
-        kS = tl.sum(k_t[:, None] * S, axis=0)  # [BD]
+        # ── delta-rule state update ──────────────────────────────────────────
+        # kS_col[j] = Σ_i  k_t[i] · S_local[i, j]
+        kS = tl.sum(k_t[:, None] * S_local, axis=0)   # [BDC]
 
-        #   r_t    = v_t − kS
-        r_t = v_t - kS  # [BD]
+        # r_t_col = v_t_col − kS_col
+        r_t = v_t - kS   # [BDC]
 
-        #   S     += β · outer(k_t, r_t)
-        #   outer[i,j] = k_t[i] * r_t[j]  via broadcast
-        S = S + bt * (k_t[:, None] * r_t[None, :])  # [BD, BD]
+        # S_local += β_t · outer(k_t, r_t_col)   [BD, BDC]
+        S_local = S_local + bt * (k_t[:, None] * r_t[None, :])
 
         # ── output ──────────────────────────────────────────────────────────
-        #   o_t[j] = Σ_i  q_t[i] * S[i, j]
-        o_t = tl.sum(q_t[:, None] * S, axis=0)  # [BD]
+        q_t = tl.load(
+            q_base + t * sq_t + d_row * sq_d, mask=row_mask, other=0.0
+        ).to(tl.float32)   # [BD]
 
-        tl.store(O + o0 + t * so_t + d * so_d, o_t, mask=mask)
+        # o_t_col[j] = Σ_i  q_t[i] · S_local[i, j]
+        o_t = tl.sum(q_t[:, None] * S_local, axis=0)   # [BDC]
+
+        tl.store(o_base + t * so_t + d_col * so_d, o_t, mask=col_mask)
 
 
 def _triton_forward(
@@ -175,7 +229,7 @@ def _triton_forward(
     k: torch.Tensor,
     v: torch.Tensor,
     beta: torch.Tensor,
-    BT: int,  # kept for API compatibility; kernel is not chunked
+    BT: int,  # kept for API compatibility; actual chunk size managed by BDC
 ) -> torch.Tensor:
     """Host-side launcher for ``_cgd_fwd_kernel``."""
     B, H, T, D = q.shape
@@ -186,7 +240,12 @@ def _triton_forward(
 
     o = torch.empty_like(q)
 
-    _cgd_fwd_kernel[(B * H,)](
+    # Grid: dim-0 = (batch, head) pairs; dim-1 = column blocks.
+    # BDC is selected by autotuning; capped at BD via ``_prune_cgd_configs``.
+    # ``triton.cdiv(BD, BDC)`` gives the number of column-block programs.
+    grid = lambda meta: (B * H, triton.cdiv(BD, min(meta["BDC"], BD)))
+
+    _cgd_fwd_kernel[grid](
         q,
         k,
         v,
@@ -220,7 +279,7 @@ def _triton_forward(
         H=H,
         T=T,
         D=D,
-        # compile-time block dim
+        # compile-time block dims (BDC chosen by autotune)
         BD=BD,
     )
     return o
