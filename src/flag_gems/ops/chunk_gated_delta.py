@@ -18,6 +18,18 @@ def _next_power_of_2(n: int) -> int:
     return max(n, 16)
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=4, num_stages=3),
+        triton.Config({}, num_warps=8, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=3),
+        triton.Config({}, num_warps=8, num_stages=4),
+        triton.Config({}, num_warps=16, num_stages=2),
+        triton.Config({}, num_warps=16, num_stages=3),
+    ],
+    key=['BLOCK_SIZE_C', 'BLOCK_SIZE_D', 'DIM'],
+)
 @triton.jit
 def _chunk_gated_delta_fwd_kernel(
     q_ptr, k_ptr, v_ptr, beta_ptr, out_ptr, state_ptr,
@@ -120,6 +132,18 @@ def _chunk_gated_delta_fwd_kernel(
         )
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=4, num_stages=3),
+        triton.Config({}, num_warps=8, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=3),
+        triton.Config({}, num_warps=8, num_stages=4),
+        triton.Config({}, num_warps=16, num_stages=2),
+        triton.Config({}, num_warps=16, num_stages=3),
+    ],
+    key=['BLOCK_SIZE_C', 'BLOCK_SIZE_D', 'DIM'],
+)
 @triton.jit
 def _chunk_gated_delta_bwd_kernel(
     q_ptr, k_ptr, v_ptr, beta_ptr, do_ptr, fwd_state_ptr,
