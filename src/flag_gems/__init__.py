@@ -700,6 +700,7 @@ def all_registered_keys():
 
 
 __all__ = [
+    "_assert_async",
     "enable",
     "only_enable",
     "use_gems",
